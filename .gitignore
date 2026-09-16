@@ -1,1 +1,6 @@
 /.env
+
+# Local Python and downloaded filing artifacts
+/.venv/
+__pycache__/
+/data/raw/
