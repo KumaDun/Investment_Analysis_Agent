@@ -6,7 +6,7 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import asdict, dataclass
-from get_root_directory import get_root_directory
+from directories import get_root_directory
 
 @dataclass
 class Filing:
