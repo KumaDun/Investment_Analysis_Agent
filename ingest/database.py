@@ -90,6 +90,132 @@ def upsert_filing_manifest(manifest: FilingManifest) -> None:
             cursor.execute(filing_query, filing_value)
             cursor.executemany(document_query, document_values)
 
+def mark_document_downloading(accession_number: str, filename: str) -> None:
+    query: LiteralString = """
+        UPDATE filing_documents
+        SET
+            download_status = 'downloading',
+            storage_key = NULL,
+            downloaded_at = NULL,
+            content_type = NULL,
+            size_bytes = NULL,
+            sha256 = NULL,
+            last_error = NULL
+        WHERE
+            accession_number = %s AND filename = %s;
+    """
+
+    with get_connection() as downloading_connection:
+        with downloading_connection.cursor() as downloading_cursor:
+            downloading_cursor.execute(query, (accession_number, filename))
+            if downloading_cursor.rowcount != 1:
+                raise ValueError(
+                    "Expected exactly one document row for "
+                    f"{accession_number}/{filename}, "
+                    f"but updated {downloading_cursor.rowcount}"
+                )
+
+def mark_document_downloaded(accession_number: str, filename: str, storage_key: str, downloaded_at: str, content_type: str,
+                             size_bytes: int, sha256: str) -> None:
+    query: LiteralString = """
+        UPDATE filing_documents
+        SET
+            download_status = 'downloaded',
+            storage_key = %s,
+            downloaded_at = %s,
+            content_type = %s,
+            size_bytes = %s,
+            sha256 = %s,
+            last_error = NULL
+        WHERE
+            accession_number = %s
+            AND filename = %s
+            AND download_status = 'downloading'
+    """
+
+    values = (
+        storage_key,
+        downloaded_at,
+        content_type,
+        size_bytes,
+        sha256,
+        accession_number,
+        filename,
+    )
+
+    with get_connection() as downloaded_connection:
+        with downloaded_connection.cursor() as downloaded_cursor:
+            downloaded_cursor.execute(query, values)
+
+            if downloaded_cursor.rowcount != 1:
+                raise ValueError(
+                    "Expected exactly one downloading document for "
+                    f"{accession_number}/{filename}, "
+                    f"but updated {downloaded_cursor.rowcount}"
+                )
+
+def mark_document_failed(accession_number: str, filename: str, last_failed_attempt: str,
+                         last_error: str,) -> None:
+    query: LiteralString = """
+        UPDATE filing_documents
+        SET
+            download_status = 'failed',
+            storage_key = NULL,
+            downloaded_at = NULL,
+            content_type = NULL,
+            size_bytes = NULL,
+            sha256 = NULL,
+            last_failed_attempt = %s,
+            last_error = %s
+        WHERE
+            accession_number = %s
+            AND filename = %s
+            AND download_status = 'downloading'
+    """
+
+    values = (
+        last_failed_attempt,
+        last_error,
+        accession_number,
+        filename,
+    )
+
+    with get_connection() as failed_connection:
+        with failed_connection.cursor() as failed_cursor:
+            failed_cursor.execute(query, values)
+
+            if failed_cursor.rowcount != 1:
+                raise ValueError(
+                    "Expected exactly one downloading document for "
+                    f"{accession_number}/{filename}, "
+                    f"but updated {failed_cursor.rowcount}"
+                )
+
+def create_download_job(accession_number: str, manifest_key: str) -> int:
+    query: LiteralString = """
+        INSERT INTO download_jobs (
+            accession_number, manifest_key
+        )
+        VALUES(%s, %s)
+        ON CONFLICT (accession_number)
+        DO UPDATE SET
+            manifest_key = EXCLUDED.manifest_key,
+            updated_at = CURRENT_TIMESTAMP
+        RETURNING job_id
+    """
+
+    with get_connection() as job_connection:
+        with job_connection.cursor() as job_cursor:
+            job_cursor.execute(query, (accession_number, manifest_key))
+            job_result = job_cursor.fetchone()
+
+            if job_result is None:
+                raise RuntimeError(
+                    "PostgreSQL did not return a download job ID"
+                )
+            return int(job_result[0])
+
+
 if __name__ == "__main__":
     with get_connection() as db_connection:
         with db_connection.cursor() as db_cursor:

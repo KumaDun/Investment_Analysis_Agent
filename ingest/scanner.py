@@ -17,11 +17,11 @@ from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlsplit
 
-from ingest.database import upsert_filing_manifest
+from ingest.database import upsert_filing_manifest, create_download_job
 
 from bs4 import BeautifulSoup
 
-from directories import get_root_directory
+from directories import get_root_directory, get_filing_directory
 from ingest.models import Filing, FilingDocument, FilingManifest
 from ingest.sec_client import fetch_url
 
@@ -66,7 +66,18 @@ def select_quarterly_filings(recent: dict, cik: str, ticker: str, limit: int = 4
         # It is hard to guarantee immediate consistency across two systems
         # will adjust the order of two calls after database's implementation is finished
         manifest = save_filing_metadata(filing, documents, metadata_path)
+
         upsert_filing_manifest(manifest)
+        manifest_key = (metadata_path.resolve()
+            .relative_to(get_filing_directory().resolve())
+            .as_posix())
+
+        job_id = create_download_job(filing.accession_number, manifest_key)
+
+        print(
+            f"Download job {job_id} is ready for "
+            f"{filing.accession_number}"
+        )
 
         selected_filings.append(filing)
         seen_periods.add(filing.report_date)

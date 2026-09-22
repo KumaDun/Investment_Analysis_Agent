@@ -56,3 +56,23 @@ CREATE TABLE IF NOT EXISTS filing_documents (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (accession_number, filename)
 );
+
+CREATE TABLE IF NOT EXISTS download_jobs(
+    job_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    accession_number VARCHAR(20) NOT NULL
+        UNIQUE REFERENCES filings (accession_number) ON DELETE CASCADE,
+    manifest_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','queued','processing','completed','failed')),
+    attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK (attempt_count >= 0),
+    redis_message_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    queued_at TIMESTAMPTZ,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    last_failed_at TIMESTAMPTZ,
+    last_error TEXT
+);
+

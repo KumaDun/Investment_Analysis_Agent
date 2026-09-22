@@ -9,6 +9,7 @@ from dataclasses import asdict
 from directories import get_filing_directory
 from ingest.models import Filing, FilingManifest, FilingDocument
 from ingest.sec_client import fetch_url
+from ingest.database import mark_document_failed, mark_document_downloaded, mark_document_downloading
 
 """
 Write new content to a temporary file and then rename it to the final destination.
@@ -60,6 +61,9 @@ def download_document(manifest: FilingManifest, document: FilingDocument, metada
 
     document_path = (filing_directory / document.filename).resolve()
 
+    """
+    Path validation
+    """
     if not filing_directory.is_relative_to(storage_root):
         raise ValueError(f" Manifest's path is {filing_directory}. It is not within the storage root {storage_root}")
 
@@ -71,6 +75,7 @@ def download_document(manifest: FilingManifest, document: FilingDocument, metada
             "Document cannot overwrite its manifest"
         )
 
+    accession_number = manifest.filing.accession_number
     storage_key = document_path.relative_to(storage_root).as_posix()
 
     # Skip a completed download only when its local file still matches.
@@ -95,6 +100,7 @@ def download_document(manifest: FilingManifest, document: FilingDocument, metada
     document.sha256 = None
     document.last_error = None
 
+    mark_document_downloading(accession_number, document.filename)
     save_manifest(manifest, metadata_path)
 
     try:
@@ -108,21 +114,29 @@ def download_document(manifest: FilingManifest, document: FilingDocument, metada
         write_file_atomically(document_path, content)
 
     except (OSError, ValueError, EOFError) as error:
+        failed_at = datetime.now(timezone.utc).isoformat()
+        error_message = f"{type(error).__name__}: {error}"
+
         document.download_status = "failed"
-        document.last_failed_attempt = (
-            datetime.now(timezone.utc).isoformat()
-        )
-        document.last_error = f"{type(error).__name__}:{error}"
+        document.last_failed_attempt = failed_at
+        document.last_error = error_message
+        mark_document_failed(accession_number, document.filename, failed_at, error_message)
         save_manifest(manifest, metadata_path)
         return
+
+    downloaded_at = datetime.now(timezone.utc).isoformat()
+    size_bytes = len(content)
+    sha256 = hashlib.sha256(content).hexdigest()
 
     document.download_status = "downloaded"
     document.storage_key = storage_key
     document.downloaded_at = datetime.now(timezone.utc).isoformat()
     document.content_type = content_type
-    document.size_bytes = len(content)
-    document.sha256 = hashlib.sha256(content).hexdigest()
+    document.size_bytes = size_bytes
+    document.sha256 = sha256
 
+    mark_document_downloaded(accession_number, document.filename, storage_key,
+                             downloaded_at, content_type, size_bytes, sha256)
     save_manifest(manifest, metadata_path)
 
 def download_from_manifest(metadata_path: Path, headers: dict) -> FilingManifest:
