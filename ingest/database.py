@@ -6,7 +6,8 @@ from dotenv import load_dotenv
 
 from directories import get_root_directory
 
-from ingest.models import Filing, FilingManifest
+from ingest.models import Filing, FilingManifest, PendingDownloadJob, DownloadJob, FilingDocument
+
 
 def get_connection() -> psycopg.Connection:
     env_path = get_root_directory() / ".env"
@@ -21,6 +22,7 @@ def get_connection() -> psycopg.Connection:
         connect_timeout=5,
     )
 
+# Filing Table methods
 def upsert_filing_manifest(manifest: FilingManifest) -> None:
     filing_query: LiteralString = """
         INSERT INTO filings (
@@ -90,6 +92,7 @@ def upsert_filing_manifest(manifest: FilingManifest) -> None:
             cursor.execute(filing_query, filing_value)
             cursor.executemany(document_query, document_values)
 
+# filing_documents table methods
 def mark_document_downloading(accession_number: str, filename: str) -> None:
     query: LiteralString = """
         UPDATE filing_documents
@@ -191,6 +194,7 @@ def mark_document_failed(accession_number: str, filename: str, last_failed_attem
                     f"but updated {failed_cursor.rowcount}"
                 )
 
+# download_jobs table methods
 def create_download_job(accession_number: str, manifest_key: str) -> int:
     query: LiteralString = """
         INSERT INTO download_jobs (
@@ -215,6 +219,209 @@ def create_download_job(accession_number: str, manifest_key: str) -> int:
                 )
             return int(job_result[0])
 
+def mark_download_job_queued(job_id: int, redis_message_id: str) -> None:
+    query: LiteralString = """
+    UPDATE download_jobs
+    SET
+        status = 'queued',
+        redis_message_id = %s,
+        queued_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP,
+        last_error = NULL
+        WHERE
+            job_id = %s
+            AND status = 'pending'
+    """
+
+    with get_connection() as queued_connection:
+        with queued_connection.cursor() as queued_cursor:
+            queued_cursor.execute(
+                query,
+                (redis_message_id, job_id),
+            )
+
+            if queued_cursor.rowcount != 1:
+                raise ValueError(
+                    f"Expected one pending job with ID {job_id}, "
+                    f"but updated {queued_cursor.rowcount}"
+                )
+
+def get_pending_download_jobs(limit: int = 100) -> list[PendingDownloadJob]:
+    if limit < 1:
+        raise ValueError("limit must be greater than zero")
+
+    query: LiteralString = """
+            SELECT job_id, accession_number, manifest_key
+            FROM download_jobs
+            WHERE status = 'pending'
+            ORDER BY created_at, job_id
+            LIMIT %s
+        """
+
+    with get_connection() as jobs_connection:
+        with jobs_connection.cursor() as jobs_cursor:
+            jobs_cursor.execute(query, (limit,))
+            rows = jobs_cursor.fetchall()
+
+    return [
+        PendingDownloadJob(job_id=row[0], accession_number=row[1],manifest_key=row[2],)
+        for row in rows
+    ]
+
+def get_download_job(job_id: int) -> DownloadJob | None:
+    query: LiteralString = """
+        SELECT
+            job_id,
+            accession_number,
+            manifest_key,
+            status,
+            attempt_count
+        FROM download_jobs
+        WHERE job_id = %s
+    """
+
+    with get_connection() as job_connection:
+        with job_connection.cursor() as job_cursor:
+            job_cursor.execute(query, (job_id,))
+            row = job_cursor.fetchone()
+
+    if row is None:
+        return None
+
+    return DownloadJob(
+        job_id=row[0],
+        accession_number=row[1],
+        manifest_key=row[2],
+        status=row[3],
+        attempt_count=row[4],
+    )
+
+def mark_download_job_processing(job_id: int) -> None:
+    query: LiteralString = """
+        UPDATE download_jobs
+        SET
+            status = 'processing',
+            attempt_count = attempt_count + 1,
+            started_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP,
+            completed_at = NULL,
+            last_error = NULL
+        WHERE
+            job_id = %s
+            AND status = 'queued'
+    """
+
+    with get_connection() as processing_connection:
+        with processing_connection.cursor() as processing_cursor:
+            processing_cursor.execute(query, (job_id,))
+
+            if processing_cursor.rowcount != 1:
+                raise ValueError(
+                    f"Expected one queued job with ID {job_id}, "
+                    f"but updated {processing_cursor.rowcount}"
+                )
+
+def mark_download_job_completed(job_id: int) -> None:
+    query: LiteralString = """
+        UPDATE download_jobs
+        SET
+            status = 'completed',
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP,
+            last_error = NULL
+        WHERE
+            job_id = %s
+            AND status = 'processing'
+    """
+    with get_connection() as completed_connection:
+        with completed_connection.cursor() as completed_cursor:
+            completed_cursor.execute(query, (job_id,))
+
+            if completed_cursor.rowcount != 1:
+                raise ValueError(
+                    f"Expected one processing job with ID {job_id}, "
+                    f"but updated {completed_cursor.rowcount}"
+                )
+
+def mark_download_job_failed(job_id: int, last_error: str) -> None:
+    query: LiteralString = """
+        UPDATE download_jobs
+        SET
+            status = 'failed',
+            last_failed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP,
+            last_error = %s
+        WHERE
+            job_id= %s
+            AND status = 'processing'
+    """
+
+    with get_connection() as failed_connection:
+        with failed_connection.cursor() as failed_cursor:
+            failed_cursor.execute(query, (last_error, job_id))
+            if failed_cursor.rowcount != 1:
+                raise ValueError(
+                    f"Expected one processing job with ID {job_id}, "
+                    f"but updated {failed_cursor.rowcount}"
+                )
+
+def get_filing_manifest(accession_number: str) -> FilingManifest | None:
+    filing_query: LiteralString = """
+        SELECT
+            cik, ticker, form, filing_date, report_date, accession_number, primary_document
+        FROM filings
+        WHERE accession_number = %s
+    """
+
+    documents_query: LiteralString = """
+        SELECT
+            filename, document_type, source_url, document_sequence, 
+            download_status, storage_key, downloaded_at, content_type, 
+            size_bytes, sha256, last_failed_attempt, last_error
+        FROM filing_documents
+        WHERE accession_number = %s
+        ORDER BY document_sequence NULLS LAST, filename
+    """
+
+    with get_connection() as manifest_connection:
+        with manifest_connection.cursor() as manifest_cursor:
+            manifest_cursor.execute(filing_query, (accession_number,))
+            filing_row = manifest_cursor.fetchone()
+
+            if filing_row is None:
+                return None
+            manifest_cursor.execute(documents_query, (accession_number,))
+            document_rows = manifest_cursor.fetchall()
+
+    filing = Filing(
+        cik=filing_row[0], ticker=filing_row[1], form=filing_row[2], filing_date=filing_row[3].isoformat(),
+        report_date=(
+            filing_row[4].isoformat()
+            if filing_row[4] is not None
+            else None
+        ),
+        accession_number=filing_row[5], primary_document=filing_row[6],
+    )
+
+    documents = [
+        FilingDocument(
+            filename=row[0], document_type=row[1], source_url=row[2],
+            document_sequence=row[3], download_status=row[4], storage_key=row[5],
+            downloaded_at=(
+                row[6].isoformat()
+                if row[6] is not None
+                else None
+            ),
+            content_type=row[7], size_bytes=row[8], sha256=row[9],
+            last_failed_attempt=(
+                row[10].isoformat()
+                if row[10] is not None
+                else None
+            ),
+            last_error=row[11],
+        ) for row in document_rows
+    ]
+    return FilingManifest(filing=filing, documents=documents)
 
 if __name__ == "__main__":
     with get_connection() as db_connection:

@@ -1,43 +1,33 @@
-import json
-import time
 import hashlib
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from dataclasses import asdict
 
 from directories import get_filing_directory
-from ingest.models import Filing, FilingManifest, FilingDocument
+from ingest.models import (
+    DocumentDownloadResult,
+    FilingDocument,
+)
 from ingest.sec_client import fetch_url
-from ingest.database import mark_document_failed, mark_document_downloaded, mark_document_downloading
 
-"""
-Write new content to a temporary file and then rename it to the final destination.
-Separate from scanner.py because scanner preserves the older existing file
-"""
 
 HEADERS = {
-        "User-Agent": "InvestAnalysis/0.1 xuyun.lake@gmail.com",
-        "Accept-Encoding": "gzip",
-    }
+    "User-Agent": "InvestAnalysis/0.1 xuyun.lake@gmail.com",
+    "Accept-Encoding": "gzip",
+}
 
-def load_manifest(metadata_path: Path) -> FilingManifest:
-    saved = json.loads(metadata_path.read_text(encoding="utf-8"))
-    return FilingManifest(
-        filing = Filing(**saved["filing"]),
-        documents= [FilingDocument(**item) for item in saved["documents"]]
-    )
 
-def write_file_atomically(path: Path, content: bytes):
+def write_file_atomically(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = None
+    temporary_path: Path | None = None
 
     try:
         with tempfile.NamedTemporaryFile(
-            dir = path.parent,
+            dir=path.parent,
             prefix=".ingest-",
-            suffix = ".tmp",
-            delete = False,
+            suffix=".tmp",
+            delete=False,
         ) as temporary_file:
             temporary_path = Path(temporary_file.name)
             temporary_file.write(content)
@@ -47,117 +37,89 @@ def write_file_atomically(path: Path, content: bytes):
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
 
-def save_manifest(manifest: FilingManifest, metadata_path: Path) -> None:
-    content = json.dumps(asdict(manifest), indent=2).encode("utf-8")
-    write_file_atomically(metadata_path, content)
 
-"""
-Download
-"""
-
-def download_document(manifest: FilingManifest, document: FilingDocument, metadata_path: Path, headers: dict) -> None:
+def resolve_document_location(filing_directory: Path, filename: str,) -> tuple[Path, str]:
     storage_root = get_filing_directory().resolve()
-    filing_directory = metadata_path.resolve().parent
+    resolved_filing_directory = filing_directory.resolve()
 
-    document_path = (filing_directory / document.filename).resolve()
-
-    """
-    Path validation
-    """
-    if not filing_directory.is_relative_to(storage_root):
-        raise ValueError(f" Manifest's path is {filing_directory}. It is not within the storage root {storage_root}")
-
-    if (document_path == filing_directory) or not document_path.is_relative_to(filing_directory):
-        raise ValueError(f"Document path {document_path} is not within the filing directory {filing_directory}")
-
-    if document_path == metadata_path.resolve():
+    if not resolved_filing_directory.is_relative_to(storage_root):
         raise ValueError(
-            "Document cannot overwrite its manifest"
+            f"Filing directory {resolved_filing_directory} "
+            f"is outside storage root {storage_root}"
         )
 
-    accession_number = manifest.filing.accession_number
+    document_path = (resolved_filing_directory / filename).resolve()
+
+    if (document_path == resolved_filing_directory or
+            not document_path.is_relative_to(resolved_filing_directory)):
+        raise ValueError(
+            f"Document path {document_path} "
+            f"is outside filing directory "
+            f"{resolved_filing_directory}"
+        )
+
+    manifest_path = (resolved_filing_directory / "filing.json").resolve()
+
+    if document_path == manifest_path:
+        raise ValueError(
+            "Document cannot overwrite filing.json"
+        )
+
     storage_key = document_path.relative_to(storage_root).as_posix()
 
-    # Skip a completed download only when its local file still matches.
-    if (
-            document.download_status == "downloaded"
-            and document_path.is_file()
-            and document.storage_key == storage_key
-            and document_path.stat().st_size == document.size_bytes
-    ):
-        current_hash = hashlib.sha256(
-            document_path.read_bytes()
-        ).hexdigest()
+    return document_path, storage_key
 
-        if current_hash == document.sha256:
-            return
 
-    document.download_status = "downloading"
-    document.storage_key = None
-    document.downloaded_at = None
-    document.content_type = None
-    document.size_bytes = None
-    document.sha256 = None
-    document.last_error = None
+def calculate_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
 
-    mark_document_downloading(accession_number, document.filename)
-    save_manifest(manifest, metadata_path)
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
 
-    try:
-        time.sleep(0.5)
-        content, content_type = fetch_url(document.source_url, headers)
+    return digest.hexdigest()
 
-        if document_path.suffix.lower() in {".htm", ".html"}:
-            if "html" not in content_type.lower():
-                raise ValueError(f"Expected HTML but received {content_type}")
 
-        write_file_atomically(document_path, content)
+def is_document_file_valid(document: FilingDocument, filing_directory: Path,) -> bool:
+    if document.download_status != "downloaded":
+        return False
 
-    except (OSError, ValueError, EOFError) as error:
-        failed_at = datetime.now(timezone.utc).isoformat()
-        error_message = f"{type(error).__name__}: {error}"
+    document_path, storage_key = resolve_document_location(filing_directory, document.filename,)
 
-        document.download_status = "failed"
-        document.last_failed_attempt = failed_at
-        document.last_error = error_message
-        mark_document_failed(accession_number, document.filename, failed_at, error_message)
-        save_manifest(manifest, metadata_path)
-        return
+    if not document_path.is_file():
+        return False
+    if document.storage_key != storage_key:
+        return False
+    if document.size_bytes is None:
+        return False
+    if document_path.stat().st_size != document.size_bytes:
+        return False
+    if document.sha256 is None:
+        return False
 
-    downloaded_at = datetime.now(timezone.utc).isoformat()
-    size_bytes = len(content)
-    sha256 = hashlib.sha256(content).hexdigest()
+    return calculate_file_sha256(document_path) == document.sha256
 
-    document.download_status = "downloaded"
-    document.storage_key = storage_key
-    document.downloaded_at = datetime.now(timezone.utc).isoformat()
-    document.content_type = content_type
-    document.size_bytes = size_bytes
-    document.sha256 = sha256
 
-    mark_document_downloaded(accession_number, document.filename, storage_key,
-                             downloaded_at, content_type, size_bytes, sha256)
-    save_manifest(manifest, metadata_path)
+def download_document(document: FilingDocument, filing_directory: Path, headers: dict[str, str],) -> DocumentDownloadResult:
+    document_path, storage_key = resolve_document_location(filing_directory, document.filename,)
 
-def download_from_manifest(metadata_path: Path, headers: dict) -> FilingManifest:
-    metadata_path = metadata_path.resolve()
-    manifest = load_manifest(metadata_path)
+    time.sleep(0.5)
+    content, content_type = fetch_url(document.source_url, headers,)
 
-    for document in manifest.documents:
-        download_document(manifest, document, metadata_path, headers)
-        print(
-            document.filename,
-            document.download_status,
-            document.last_error or "",
-        )
+    if document_path.suffix.lower() in {".htm", ".html"}:
+        if "html" not in content_type.lower():
+            raise ValueError(
+                f"Expected HTML but received {content_type}"
+            )
 
-    return manifest
+    write_file_atomically(document_path, content)
 
-def main():
-    metadata_path = (
-        get_filing_directory()/"DIS"/"10-Q_0001744489-26-000057"/"filing.json"
+    return DocumentDownloadResult(
+        storage_key=storage_key,
+        downloaded_at=datetime.now(
+            timezone.utc
+        ).isoformat(),
+        content_type=content_type,
+        size_bytes=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
     )
-    download_from_manifest(metadata_path, headers = HEADERS)
-
-if __name__ == "__main__":
-    main()

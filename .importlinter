@@ -1,0 +1,18 @@
+[importlinter]
+root_package = ingest
+[importlinter:contract:ingest-layers]
+name = Ingest dependency layers
+type = layers
+layers =
+    (ingest.download_worker)
+    ingest.download_producer | ingest.scanner
+    ingest.database | ingest.download_queue | ingest.downloader | (ingest.manifest_store)
+    ingest.sec_client
+    ingest.models
+
+[importlinter:contract:no-cycles]
+name = Ingest modules must not form dependency cycles
+type = acyclic_siblings
+ancestors =
+    ingest
+depth = 0
