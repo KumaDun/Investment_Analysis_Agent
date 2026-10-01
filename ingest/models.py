@@ -31,25 +31,12 @@ class FilingManifest:
     documents: list[FilingDocument]
 
 @dataclass(frozen=True)
-class PendingDownloadJob:
-    job_id: int
-    accession_number: str
-    manifest_key: str
-
-@dataclass(frozen=True)
 class DownloadJob:
     job_id: int
     accession_number: str
     manifest_key: str
     status: str
     attempt_count: int
-
-@dataclass(frozen=True)
-class DownloadQueueMessage:
-    message_id: str
-    job_id: int
-    accession_number: str
-    manifest_key: str
 
 @dataclass(frozen=True)
 class DocumentDownloadResult:

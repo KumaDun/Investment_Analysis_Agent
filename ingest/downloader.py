@@ -11,13 +11,6 @@ from ingest.models import (
 )
 from ingest.sec_client import fetch_url
 
-
-HEADERS = {
-    "User-Agent": "InvestAnalysis/0.1 xuyun.lake@gmail.com",
-    "Accept-Encoding": "gzip",
-}
-
-
 def write_file_atomically(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None

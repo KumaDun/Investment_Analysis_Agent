@@ -1,12 +1,12 @@
 [importlinter]
 root_package = ingest
+
 [importlinter:contract:ingest-layers]
 name = Ingest dependency layers
 type = layers
 layers =
-    (ingest.download_worker)
-    ingest.download_producer | ingest.scanner
-    ingest.database | ingest.download_queue | ingest.downloader | (ingest.manifest_store)
+    ingest.download_jobs | ingest.scanner
+    ingest.database | ingest.downloader
     ingest.sec_client
     ingest.models
 

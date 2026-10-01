@@ -17,23 +17,18 @@ from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlsplit
 
-from ingest.database import upsert_filing_manifest, create_download_job
+from ingest.database import upsert_filing_manifest, create_download_job, get_connection, get_filing_manifest
 
 from bs4 import BeautifulSoup
 
-from directories import get_root_directory, get_filing_directory
+from directories import get_root_directory, get_filing_directory, HEADERS
 from ingest.models import Filing, FilingDocument, FilingManifest
 from ingest.sec_client import fetch_url
-
-HEADERS = {
-        "User-Agent": "InvestAnalysis/0.1 xuyun.lake@gmail.com",
-        "Accept-Encoding": "gzip",
-    }
 
 def select_quarterly_filings(recent: dict, cik: str, ticker: str, limit: int = 4, headers: dict = HEADERS) -> list[Filing]:
     if limit < 1:
         raise ValueError("limit must be greater than 0")
-    filings = []
+    filings: list[Filing] = []
     for index in range(len(recent["form"])):
         filing = Filing(
             cik=cik,
@@ -48,12 +43,13 @@ def select_quarterly_filings(recent: dict, cik: str, ticker: str, limit: int = 4
             filings.append(filing)
 
     filings.sort(
-        key=lambda one_filing: (one_filing.report_date, one_filing.filing_date),
+        key=lambda one_filing: (one_filing.report_date or "", one_filing.filing_date),
         reverse=True,
     )
 
-    selected_filings = []
-    seen_periods = set()
+    selected_filings: list[Filing] = []
+    seen_periods: set[str] = set()
+
     for filing in filings:
         if not filing.report_date or filing.report_date in seen_periods:
             continue
@@ -61,54 +57,39 @@ def select_quarterly_filings(recent: dict, cik: str, ticker: str, limit: int = 4
         metadata_path = make_filing_metadata_directory(filing)
         time.sleep(0.5)
         documents: list[FilingDocument] = discover_documents(filing, headers)
-
-        # TODO atomicity across file system and database.
-        # It is hard to guarantee immediate consistency across two systems
-        # will adjust the order of two calls after database's implementation is finished
-        manifest = save_filing_metadata(filing, documents, metadata_path)
-
-        upsert_filing_manifest(manifest)
+        manifest = FilingManifest(filing=filing, documents=documents)
         manifest_key = (metadata_path.resolve()
             .relative_to(get_filing_directory().resolve())
             .as_posix())
 
-        job_id = create_download_job(filing.accession_number, manifest_key)
+        with get_connection() as connection:
+            upsert_filing_manifest(manifest, connection)
+            job_id = create_download_job(filing.accession_number, manifest_key, connection)
+
+        stored_manifest = get_filing_manifest(filing.accession_number)
+        if stored_manifest is None:
+            raise RuntimeError(f"Stored filing {filing.accession_number} not found")
+        save_filing_metadata(stored_manifest, metadata_path)
 
         print(
             f"Download job {job_id} is ready for "
             f"{filing.accession_number}"
         )
-
         selected_filings.append(filing)
         seen_periods.add(filing.report_date)
+
         if len(selected_filings) == limit:
             break
 
     if len(selected_filings) < limit:
         print(
-            f"The recent filing history contains fewer than {limit} "
-            "distinct 10-Q reporting periods."
+            f"Found {len(selected_filings)} distinct 10-Q reporting "
+            f"periods for {ticker}; requested {limit}."
         )
+
     return selected_filings
 
-def save_filing_metadata(filing: Filing, documents: list[FilingDocument], metadata_path: Path) -> FilingManifest:
-    existing_documents: dict[str, FilingDocument] = {}
-    if metadata_path.exists():
-        saved = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if saved["filing"]["accession_number"] != filing.accession_number:
-            raise ValueError(
-                f"Accession number mismatch: {filing.accession_number} != {saved["filing"]['accession_number']}"
-            )
-
-        for item in saved["documents"]:
-            existing_documents[item["filename"]] = FilingDocument(**item)
-
-    # Keep existing records unchanged; add newly discovered documents
-    for document in documents:
-        if document.filename not in existing_documents:
-            existing_documents[document.filename] = document
-
-    manifest = FilingManifest(filing=filing, documents=list(existing_documents.values()))
+def save_filing_metadata(manifest: FilingManifest, metadata_path: Path) -> None:
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = metadata_path.with_suffix(".json.tmp")
 
@@ -120,7 +101,7 @@ def save_filing_metadata(filing: Filing, documents: list[FilingDocument], metada
         temporary_path.replace(metadata_path)
     finally:
         temporary_path.unlink(missing_ok=True)
-    return manifest
+    return None
 
 
 def scan_matched_tickers_by_tickers(tickers: list[str], headers: dict = HEADERS) -> list[dict]:
@@ -230,7 +211,9 @@ def scan_filings_by_tickers(tickers: list[str], headers: dict,limit: int = 4) ->
         content, _ = fetch_url(submissions_url, headers)
         submissions = json.loads(content)
 
-        company_filings = select_quarterly_filings(submissions["filings"]["recent"],cik,company["ticker"],limit, headers=headers)
+        company_filings = select_quarterly_filings(
+            submissions["filings"]["recent"], cik,
+            company["ticker"], limit = limit, headers=headers)
         matched_filings.extend(company_filings)
 
     return matched_filings

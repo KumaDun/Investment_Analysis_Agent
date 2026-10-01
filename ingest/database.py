@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 from directories import get_root_directory
 
-from ingest.models import Filing, FilingManifest, PendingDownloadJob, DownloadJob, FilingDocument
+from ingest.models import Filing, FilingManifest, DownloadJob, FilingDocument
 
 
 def get_connection() -> psycopg.Connection:
@@ -22,8 +22,11 @@ def get_connection() -> psycopg.Connection:
         connect_timeout=5,
     )
 
+DISPATCH_RETRY_SECONDS = 300
+
+
 # Filing Table methods
-def upsert_filing_manifest(manifest: FilingManifest) -> None:
+def upsert_filing_manifest(manifest: FilingManifest, connection: psycopg.Connection | None = None) -> None:
     filing_query: LiteralString = """
         INSERT INTO filings (
         accession_number, cik, ticker, form, filing_date, report_date, primary_document
@@ -86,8 +89,12 @@ def upsert_filing_manifest(manifest: FilingManifest) -> None:
             document.last_error,
         ) for document in manifest.documents
     ]
-
-    with get_connection() as connection:
+    if connection is None:
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(filing_query, filing_value)
+                cursor.executemany(document_query, document_values)
+    else:
         with connection.cursor() as cursor:
             cursor.execute(filing_query, filing_value)
             cursor.executemany(document_query, document_values)
@@ -195,7 +202,8 @@ def mark_document_failed(accession_number: str, filename: str, last_failed_attem
                 )
 
 # download_jobs table methods
-def create_download_job(accession_number: str, manifest_key: str) -> int:
+def create_download_job(accession_number: str, manifest_key: str,
+                        connection: psycopg.Connection) -> int:
     query: LiteralString = """
         INSERT INTO download_jobs (
             accession_number, manifest_key
@@ -203,70 +211,66 @@ def create_download_job(accession_number: str, manifest_key: str) -> int:
         VALUES(%s, %s)
         ON CONFLICT (accession_number)
         DO UPDATE SET
-            manifest_key = EXCLUDED.manifest_key,
             updated_at = CURRENT_TIMESTAMP
         RETURNING job_id
     """
 
-    with get_connection() as job_connection:
-        with job_connection.cursor() as job_cursor:
-            job_cursor.execute(query, (accession_number, manifest_key))
-            job_result = job_cursor.fetchone()
+    reopen_query: LiteralString = """
+            UPDATE download_jobs AS job
+            SET status = 'pending',
+                attempt_count = 0,
+                queued_at = NULL,
+                started_at = NULL,
+                completed_at = NULL,
+                last_failed_at = NULL,
+                last_error = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE job.job_id = %s
+              AND job.status = 'completed'
+              AND EXISTS (
+                  SELECT 1
+                  FROM filing_documents AS document
+                  WHERE document.accession_number = job.accession_number
+                    AND document.download_status <> 'downloaded'
+              )
+        """
 
-            if job_result is None:
-                raise RuntimeError(
-                    "PostgreSQL did not return a download job ID"
-                )
-            return int(job_result[0])
+    with connection.cursor() as job_cursor:
+        job_cursor.execute(query, (accession_number, manifest_key))
+        row = job_cursor.fetchone()
+        if row is None:
+            raise RuntimeError("PostgreSQL did not return a download job ID")
+        job_id = row[0]
+        job_cursor.execute(reopen_query, (job_id,))
+    return job_id
 
-def mark_download_job_queued(job_id: int, redis_message_id: str) -> None:
+
+def mark_download_job_queued(job_id: int) -> bool:
     query: LiteralString = """
     UPDATE download_jobs
     SET
         status = 'queued',
-        redis_message_id = %s,
         queued_at = CURRENT_TIMESTAMP,
-        updated_at = CURRENT_TIMESTAMP,
-        last_error = NULL
-        WHERE
-            job_id = %s
-            AND status = 'pending'
+        updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = %s
+          AND (
+              status = 'pending'
+              OR (
+                  status = 'queued'
+                  AND queued_at <= CURRENT_TIMESTAMP
+                      - (%s * INTERVAL '1 second')
+              )
+          )
+        RETURNING job_id
     """
 
     with get_connection() as queued_connection:
         with queued_connection.cursor() as queued_cursor:
             queued_cursor.execute(
                 query,
-                (redis_message_id, job_id),
+                (job_id, DISPATCH_RETRY_SECONDS),
             )
-
-            if queued_cursor.rowcount != 1:
-                raise ValueError(
-                    f"Expected one pending job with ID {job_id}, "
-                    f"but updated {queued_cursor.rowcount}"
-                )
-
-def get_pending_download_jobs(limit: int = 100) -> list[PendingDownloadJob]:
-    if limit < 1:
-        raise ValueError("limit must be greater than zero")
-
-    query: LiteralString = """
-            SELECT job_id, accession_number, manifest_key
-            FROM download_jobs
-            WHERE status = 'pending'
-            ORDER BY created_at, job_id
-            LIMIT %s
-        """
-
-    with get_connection() as jobs_connection:
-        with jobs_connection.cursor() as jobs_cursor:
-            jobs_cursor.execute(query, (limit,))
-            rows = jobs_cursor.fetchall()
-
-    return [
-        PendingDownloadJob(job_id=row[0], accession_number=row[1],manifest_key=row[2],)
-        for row in rows
-    ]
+            return queued_cursor.fetchone() is not None
 
 def get_download_job(job_id: int) -> DownloadJob | None:
     query: LiteralString = """
@@ -296,7 +300,7 @@ def get_download_job(job_id: int) -> DownloadJob | None:
         attempt_count=row[4],
     )
 
-def mark_download_job_processing(job_id: int) -> None:
+def claim_download_job_processing(job_id: int) -> bool:
     query: LiteralString = """
         UPDATE download_jobs
         SET
@@ -314,14 +318,30 @@ def mark_download_job_processing(job_id: int) -> None:
     with get_connection() as processing_connection:
         with processing_connection.cursor() as processing_cursor:
             processing_cursor.execute(query, (job_id,))
-
-            if processing_cursor.rowcount != 1:
-                raise ValueError(
-                    f"Expected one queued job with ID {job_id}, "
-                    f"but updated {processing_cursor.rowcount}"
-                )
+            return processing_cursor.rowcount == 1
+            # if processing_cursor.rowcount != 1:
+            #     raise ValueError(
+            #         f"Expected one queued job with ID {job_id}, "
+            #         f"but updated {processing_cursor.rowcount}"
+            #     )
 
 def mark_download_job_completed(job_id: int) -> None:
+    lock_query: LiteralString = """
+            SELECT accession_number
+            FROM download_jobs
+            WHERE job_id = %s
+              AND status = 'processing'
+            FOR UPDATE
+        """
+    unfinished_query: LiteralString = """
+            SELECT EXISTS (
+                SELECT 1
+                FROM filing_documents
+                WHERE accession_number = %s
+                  AND download_status <> 'downloaded'
+            )
+        """
+
     query: LiteralString = """
         UPDATE download_jobs
         SET
@@ -422,6 +442,25 @@ def get_filing_manifest(accession_number: str) -> FilingManifest | None:
         ) for row in document_rows
     ]
     return FilingManifest(filing=filing, documents=documents)
+
+def get_download_jobs_to_dispatch(limit: int = 100) -> list[int]:
+    if limit < 1:
+        raise ValueError("limit must be greater than zero")
+    query: LiteralString = """
+        SELECT job_id
+        FROM download_jobs
+        WHERE status = 'pending'
+            OR (
+                status = 'queued'
+                AND queued_at <= CURRENT_TIMESTAMP - (%s * INTERVAL '1 second')
+            )
+        ORDER BY created_at, job_id
+        LIMIT %s
+    """
+    with get_connection() as dispatch_connection:
+        with dispatch_connection.cursor() as dispatch_cursor:
+            dispatch_cursor.execute(query, (DISPATCH_RETRY_SECONDS, limit))
+            return [int(row[0]) for row in dispatch_cursor.fetchall()]
 
 if __name__ == "__main__":
     with get_connection() as db_connection:
