@@ -22,7 +22,9 @@ def get_connection() -> psycopg.Connection:
         connect_timeout=5,
     )
 
+MAX_DOWNLOAD_ATTEMPTS = 3
 DISPATCH_RETRY_SECONDS = 300
+FAILED_RETRY_SECONDS = 300
 
 
 # Filing Table methods
@@ -260,6 +262,12 @@ def mark_download_job_queued(job_id: int) -> bool:
                   AND queued_at <= CURRENT_TIMESTAMP
                       - (%s * INTERVAL '1 second')
               )
+              OR (
+                  status = 'failed'
+                  AND attempt_count < %s
+                  AND last_failed_at <= CURRENT_TIMESTAMP
+                      - (%s * INTERVAL '1 second')
+              )
           )
         RETURNING job_id
     """
@@ -268,7 +276,7 @@ def mark_download_job_queued(job_id: int) -> bool:
         with queued_connection.cursor() as queued_cursor:
             queued_cursor.execute(
                 query,
-                (job_id, DISPATCH_RETRY_SECONDS),
+                (job_id, DISPATCH_RETRY_SECONDS, MAX_DOWNLOAD_ATTEMPTS, FAILED_RETRY_SECONDS),
             )
             return queued_cursor.fetchone() is not None
 
@@ -326,41 +334,77 @@ def claim_download_job_processing(job_id: int) -> bool:
             #     )
 
 def mark_download_job_completed(job_id: int) -> None:
-    lock_query: LiteralString = """
-            SELECT accession_number
-            FROM download_jobs
-            WHERE job_id = %s
-              AND status = 'processing'
-            FOR UPDATE
-        """
+    filing_lock_query: LiteralString = """
+        SELECT filing.accession_number
+        FROM filings AS filing
+        JOIN download_jobs AS job
+        ON job.accession_number = filing.accession_number
+        WHERE job.job_id = %s
+        FOR UPDATE OF filing
+    """
+    job_lock_query: LiteralString = """
+        SELECT job_id
+        FROM download_jobs
+        WHERE job_id = %s
+        AND status = 'processing'
+        FOR UPDATE
+    """
     unfinished_query: LiteralString = """
-            SELECT EXISTS (
-                SELECT 1
-                FROM filing_documents
-                WHERE accession_number = %s
-                  AND download_status <> 'downloaded'
-            )
-        """
-
-    query: LiteralString = """
+        SELECT EXISTS (
+            SELECT 1
+            FROM filing_documents
+            WHERE accession_number = %s
+              AND download_status <> 'downloaded'
+        )
+    """
+    pending_query: LiteralString = """
         UPDATE download_jobs
-        SET
-            status = 'completed',
+        SET status = 'pending',
+            attempt_count = 0,
+            queued_at = NULL,
+            started_at = NULL,
+            completed_at = NULL,
+            last_failed_at = NULL,
+            last_error = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = %s
+        AND status = 'processing'
+    """
+
+    completed_query: LiteralString = """
+        UPDATE download_jobs
+        SET status = 'completed',
             completed_at = CURRENT_TIMESTAMP,
             updated_at = CURRENT_TIMESTAMP,
             last_error = NULL
-        WHERE
-            job_id = %s
-            AND status = 'processing'
+        WHERE job_id = %s
+        AND status = 'processing'
     """
-    with get_connection() as completed_connection:
-        with completed_connection.cursor() as completed_cursor:
-            completed_cursor.execute(query, (job_id,))
 
-            if completed_cursor.rowcount != 1:
+    with get_connection() as complete_connection:
+        with complete_connection.cursor() as complete_cursor:
+            complete_cursor.execute(filing_lock_query, (job_id,))
+            filing_row = complete_cursor.fetchone()
+            if filing_row is None:
+                raise ValueError(f"No filing found for download job {job_id}")
+
+            accession_number = filing_row[0]
+            complete_cursor.execute(job_lock_query, (job_id,))
+            if complete_cursor.fetchone() is None:
+                raise ValueError(f"Expected one processing job with ID {job_id}")
+
+            complete_cursor.execute(unfinished_query, (accession_number,))
+            unfinished_row = complete_cursor.fetchone()
+            if unfinished_row is None:
+                raise RuntimeError("Document status check returned no result")
+            if unfinished_row[0]:
+                complete_cursor.execute(pending_query, (job_id,))
+            else:
+                complete_cursor.execute(completed_query, (job_id,))
+            if complete_cursor.rowcount != 1:
                 raise ValueError(
                     f"Expected one processing job with ID {job_id}, "
-                    f"but updated {completed_cursor.rowcount}"
+                    f"but updated {complete_cursor.rowcount}"
                 )
 
 def mark_download_job_failed(job_id: int, last_error: str) -> None:
@@ -454,12 +498,18 @@ def get_download_jobs_to_dispatch(limit: int = 100) -> list[int]:
                 status = 'queued'
                 AND queued_at <= CURRENT_TIMESTAMP - (%s * INTERVAL '1 second')
             )
+            OR (
+               status = 'failed'
+               AND attempt_count < %s
+               AND last_failed_at <= CURRENT_TIMESTAMP
+                   - (%s * INTERVAL '1 second')
+           )
         ORDER BY created_at, job_id
         LIMIT %s
     """
     with get_connection() as dispatch_connection:
         with dispatch_connection.cursor() as dispatch_cursor:
-            dispatch_cursor.execute(query, (DISPATCH_RETRY_SECONDS, limit))
+            dispatch_cursor.execute(query, (DISPATCH_RETRY_SECONDS, MAX_DOWNLOAD_ATTEMPTS, FAILED_RETRY_SECONDS, limit))
             return [int(row[0]) for row in dispatch_cursor.fetchall()]
 
 if __name__ == "__main__":
